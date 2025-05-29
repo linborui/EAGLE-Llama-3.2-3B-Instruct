@@ -1,13 +1,15 @@
 import argparse
 
 parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
+parser.add_argument('--basepath', type=str, default='/home/user/weights/model/')
 parser.add_argument('--configpath', type=str, default="config.json")
-parser.add_argument('--lr', type=float, default=3e-5)
-parser.add_argument('--bs', type=int, default=4)
+parser.add_argument('--lr', type=float, default=5e-5)
+parser.add_argument('--bs', type=int, default=1)
 parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
 parser.add_argument('--tmpdir', type=str, default='0')
 parser.add_argument('--cpdir', type=str, default='0')
+parser.add_argument('--project', type=str, default='EAGLE3-training')
+parser.add_argument('--entity', type=str, required=True)
 args = parser.parse_args()
 
 train_config = {
@@ -37,13 +39,14 @@ train_config = {
     "b1": 0.9,
     "b2": 0.95,
     "grad_clip": 0.5,
-    "save_freq": 5
+    "save_freq": 2
 }
 import json
 from safetensors import safe_open
 # from transformers import AutoModelForCausalLM, AutoTokenizer,AutoModelForSequenceClassification
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -67,7 +70,7 @@ from transformers import get_linear_schedule_with_warmup, AutoConfig
 if accelerator.is_main_process:
     import wandb
 
-    wandb.init(project="ess", entity="yuhui-li", config=train_config)
+    wandb.init(project=args.project, entity=args.entity, config=train_config)
 
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
@@ -76,19 +79,29 @@ head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False
 try:
     with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
         index_json = json.loads(f.read())
-        head_path = index_json["weight_map"]["lm_head.weight"]
+        weight_map = index_json["weight_map"]
+        if baseconfig.tie_word_embeddings:
+            head_layer = "model.embed_tokens.weight"
+        else:
+            head_layer = "lm_head.weight"
+        head_path = index_json["weight_map"][head_layer]
     with safe_open(os.path.join(args.basepath, head_path),
                    framework="pt",
                    device="cpu") as f:
-        tensor_slice = f.get_slice("lm_head.weight")
+        tensor_slice = f.get_slice(head_layer)
         vocab_size, hidden_dim = tensor_slice.get_shape()
         tensor = tensor_slice[:, :hidden_dim].float()
 except:
     with open(os.path.join(args.basepath, "pytorch_model.bin.index.json"), "r") as f:
         index_json = json.loads(f.read())
-        head_path = index_json["weight_map"]["lm_head.weight"]
+        weight_map = index_json["weight_map"]
+        if baseconfig.tie_word_embeddings:
+            head_layer = "model.embed_tokens.weight"
+        else:
+            head_layer = "lm_head.weight"
+        head_path = index_json["weight_map"][head_layer]
     weights = torch.load(os.path.join(args.basepath, head_path))
-    tensor = weights["lm_head.weight"].float()
+    tensor = weights[head_layer].float()
 
 head.weight.data = tensor
 head.eval()
@@ -405,7 +418,7 @@ for epoch in range(num_epochs + 1):
         print('Train Accuracy: {:.2f}%'.format(100 * correct / total))
         wandb.log({"train/epochacc": correct / total, "train/epochloss": epoch_loss})
 
-    if (epoch + 1) % train_config["save_freq"]:
+    if (epoch + 1) % train_config["save_freq"] == 0 or epoch == num_epochs:
         top_3acc = [0 for _ in range(3)]
         correct = 0
         total = 0
